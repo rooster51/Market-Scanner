@@ -594,3 +594,4 @@ if st.button("Scan Watchlist"):
         scan_df["Sort"] = scan_df["Setup"].map(priority).fillna(99)
         scan_df = scan_df.sort_values(["Sort", "Symbol"]).drop(columns=["Sort"])
         st.dataframe(scan_df, use_container_width=True)
+        
