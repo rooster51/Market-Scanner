@@ -1,103 +1,20 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
+import yfinance as yf
 
 # =========================================================
 # PAGE CONFIG
 # =========================================================
-st.set_page_config(page_title="Finnhub Zone Opportunity Scanner", layout="wide")
-st.title("Finnhub Zone Opportunity Scanner")
-st.caption("Trend + support/resistance + supply/demand + pullback watch")
+st.set_page_config(page_title="A+ Zone Opportunity Scanner", layout="wide")
+st.title("A+ Zone Opportunity Scanner")
+st.caption("Trend + support/resistance + supply/demand + pullback + no-chase warnings")
 
-# =========================================================
-# CONSTANTS
-# =========================================================
-FINNHUB_BASE = "https://finnhub.io/api/v1"
 DEFAULT_WATCHLIST = "SPY, QQQ, IWM, AAPL, NVDA, AMD, TSLA, META"
-
-# =========================================================
-# SECRETS
-# =========================================================
-def get_secret(*names: str) -> str:
-    for name in names:
-        if name in st.secrets and st.secrets[name]:
-            return str(st.secrets[name]).strip()
-    return ""
-
-FINNHUB_API_KEY = get_secret("FINNHUB_API_KEY", "FINNHUB_KEY", "API_KEY")
-
-# =========================================================
-# API HELPERS
-# =========================================================
-def finnhub_get(path: str, params: Optional[dict] = None) -> dict:
-    if not FINNHUB_API_KEY:
-        raise ValueError("Missing FINNHUB_API_KEY in Streamlit secrets.")
-
-    p = dict(params or {})
-    p["token"] = FINNHUB_API_KEY
-
-    url = f"{FINNHUB_BASE}{path}"
-    r = requests.get(url, params=p, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-def get_candles(symbol: str, resolution: str = "D", bars: int = 260) -> pd.DataFrame:
-    if resolution in {"5", "15", "30", "60"}:
-        lookback_days = 120
-    elif resolution == "W":
-        lookback_days = 365 * 5
-    else:
-        lookback_days = 365 * 2
-
-    end_dt = datetime.utcnow()
-    start_dt = end_dt - timedelta(days=lookback_days)
-
-    data = finnhub_get(
-        "/stock/candle",
-        {
-            "symbol": symbol,
-            "resolution": resolution,
-            "from": int(start_dt.timestamp()),
-            "to": int(end_dt.timestamp()),
-        },
-    )
-
-    if data.get("s") != "ok":
-        return pd.DataFrame()
-
-    df = pd.DataFrame(
-        {
-            "Timestamp": pd.to_datetime(data["t"], unit="s", utc=True).tz_convert(None),
-            "Open": pd.to_numeric(data["o"], errors="coerce"),
-            "High": pd.to_numeric(data["h"], errors="coerce"),
-            "Low": pd.to_numeric(data["l"], errors="coerce"),
-            "Close": pd.to_numeric(data["c"], errors="coerce"),
-            "Volume": pd.to_numeric(data["v"], errors="coerce"),
-        }
-    )
-
-    df = df.dropna().set_index("Timestamp").sort_index().tail(bars)
-    return df
-
-def get_quote(symbol: str) -> Optional[dict]:
-    try:
-        data = finnhub_get("/quote", {"symbol": symbol})
-        return {
-            "current": data.get("c", np.nan),
-            "high": data.get("h", np.nan),
-            "low": data.get("l", np.nan),
-            "open": data.get("o", np.nan),
-            "prev_close": data.get("pc", np.nan),
-            "timestamp": data.get("t"),
-        }
-    except Exception:
-        return None
 
 # =========================================================
 # DATA STRUCTURES
@@ -109,6 +26,40 @@ class Zone:
     kind: str   # demand / supply
     touches: int
     source_indices: List[int]
+
+# =========================================================
+# DATA
+# =========================================================
+def get_candles(symbol: str, interval: str = "D", bars: int = 300) -> pd.DataFrame:
+    interval_map = {
+        "D": ("1y", "1d"),
+        "60": ("6mo", "60m"),
+        "30": ("60d", "30m"),
+        "15": ("30d", "15m"),
+        "5": ("7d", "5m"),
+        "W": ("5y", "1wk"),
+    }
+
+    period, yf_interval = interval_map.get(interval, ("1y", "1d"))
+
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(period=period, interval=yf_interval, auto_adjust=False)
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    if not all(col in df.columns for col in needed):
+        return pd.DataFrame()
+
+    df = df[needed].copy()
+    for col in needed:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.dropna().tail(bars)
 
 # =========================================================
 # TECHNICALS
@@ -149,7 +100,7 @@ def detect_trend(df: pd.DataFrame, fast_len: int = 20, slow_len: int = 50) -> pd
     return out
 
 # =========================================================
-# PIVOTS / SUPPORT / RESISTANCE / ZONES
+# ZONES
 # =========================================================
 def find_pivots(df: pd.DataFrame, left: int = 3, right: int = 3) -> Tuple[List[int], List[int]]:
     highs = df["High"].values
@@ -161,7 +112,6 @@ def find_pivots(df: pd.DataFrame, left: int = 3, right: int = 3) -> Tuple[List[i
     for i in range(left, len(df) - right):
         if highs[i] == max(highs[i - left:i + right + 1]) and highs[i] > max(highs[i - left:i]):
             pivot_highs.append(i)
-
         if lows[i] == min(lows[i - left:i + right + 1]) and lows[i] < min(lows[i - left:i]):
             pivot_lows.append(i)
 
@@ -266,11 +216,39 @@ def zone_distance_pct(price: float, z: Zone) -> float:
     return abs(price - zone_center(z)) / max(price, 1e-9) * 100.0
 
 # =========================================================
-# OPPORTUNITY LOGIC
+# SETUP LOGIC
 # =========================================================
+def is_extended(df: pd.DataFrame, atr_mult: float = 1.5) -> bool:
+    row = df.iloc[-1]
+    if pd.isna(row["ATR"]) or row["ATR"] <= 0:
+        return False
+    distance = abs(float(row["Close"]) - float(row["EMA_FAST"]))
+    return distance > float(row["ATR"]) * atr_mult
+
+def rejection_signal(df: pd.DataFrame) -> str:
+    if len(df) < 2:
+        return "None"
+
+    row = df.iloc[-1]
+    body = abs(row["Close"] - row["Open"])
+    rng = row["High"] - row["Low"]
+
+    if rng <= 0:
+        return "None"
+
+    upper_wick = row["High"] - max(row["Open"], row["Close"])
+    lower_wick = min(row["Open"], row["Close"]) - row["Low"]
+
+    if lower_wick > body * 1.5 and lower_wick > upper_wick:
+        return "Bullish Rejection"
+    if upper_wick > body * 1.5 and upper_wick > lower_wick:
+        return "Bearish Rejection"
+
+    return "None"
+
 def classify_setup(df: pd.DataFrame, zones: List[Zone], atr_mult_near: float = 0.8) -> dict:
     if len(df) < 60:
-        return {"state": "Not enough data"}
+        return {"state": "Not enough data", "grade": "Skip", "idea": "Need more data."}
 
     row = df.iloc[-1]
     close = float(row["Close"])
@@ -279,26 +257,48 @@ def classify_setup(df: pd.DataFrame, zones: List[Zone], atr_mult_near: float = 0
     trend = row["Trend"]
     current_atr = float(row["ATR"]) if not pd.isna(row["ATR"]) else 0.0
     ema_fast = float(row["EMA_FAST"])
+    extended = is_extended(df, atr_mult=1.5)
+    rejection = rejection_signal(df)
 
     demand = nearest_zones(close, zones, "demand", n=5)
     supply = nearest_zones(close, zones, "supply", n=5)
+
+    if extended:
+        return {
+            "state": "Extended - Skip",
+            "grade": "Skip",
+            "idea": "Price is stretched too far from EMA. Do not chase.",
+        }
 
     if trend == "Bullish":
         for z in demand:
             near_zone = low <= z.high + current_atr * atr_mult_near and close >= z.low - current_atr * atr_mult_near
             near_ema = abs(close - ema_fast) <= current_atr * atr_mult_near
+            in_zone = price_in_zone(close, z)
 
-            if price_in_zone(close, z):
+            if in_zone and rejection == "Bullish Rejection":
                 return {
                     "state": "Bullish Pullback In Demand",
-                    "idea": "Look for bullish continuation if price holds demand.",
+                    "grade": "A+",
+                    "idea": "Best area to stalk bullish continuation.",
                     "zone_low": z.low,
                     "zone_high": z.high,
                 }
+
+            if in_zone:
+                return {
+                    "state": "Bullish Pullback In Demand",
+                    "grade": "A",
+                    "idea": "Good area, but wait for a stronger reaction candle.",
+                    "zone_low": z.low,
+                    "zone_high": z.high,
+                }
+
             if near_zone or near_ema:
                 return {
                     "state": "Bullish Pullback Watch",
-                    "idea": "Wait for reaction near demand / EMA, not a chase entry.",
+                    "grade": "B",
+                    "idea": "Watch for price to react in demand instead of forcing entry.",
                     "zone_low": z.low,
                     "zone_high": z.high,
                 }
@@ -307,29 +307,47 @@ def classify_setup(df: pd.DataFrame, zones: List[Zone], atr_mult_near: float = 0
         if nearest_supply and zone_distance_pct(close, nearest_supply[0]) < 1.0:
             return {
                 "state": "Bullish But Near Resistance",
-                "idea": "Be careful. Price is getting close to overhead supply/resistance.",
+                "grade": "C",
+                "idea": "Trend is up, but overhead supply is close. Risk of reversal is higher.",
                 "zone_low": nearest_supply[0].low,
                 "zone_high": nearest_supply[0].high,
             }
 
-        return {"state": "Bullish Trend - No Pullback", "idea": "Wait for a pullback instead of chasing."}
+        return {
+            "state": "Bullish Trend - No Pullback",
+            "grade": "Wait",
+            "idea": "Trend is good, but entry location is not. Wait for pullback.",
+        }
 
     if trend == "Bearish":
         for z in supply:
             near_zone = high >= z.low - current_atr * atr_mult_near and close <= z.high + current_atr * atr_mult_near
             near_ema = abs(close - ema_fast) <= current_atr * atr_mult_near
+            in_zone = price_in_zone(close, z)
 
-            if price_in_zone(close, z):
+            if in_zone and rejection == "Bearish Rejection":
                 return {
                     "state": "Bearish Pullback In Supply",
-                    "idea": "Look for bearish continuation if price rejects supply.",
+                    "grade": "A+",
+                    "idea": "Best area to stalk bearish continuation.",
                     "zone_low": z.low,
                     "zone_high": z.high,
                 }
+
+            if in_zone:
+                return {
+                    "state": "Bearish Pullback In Supply",
+                    "grade": "A",
+                    "idea": "Good area, but wait for a stronger rejection candle.",
+                    "zone_low": z.low,
+                    "zone_high": z.high,
+                }
+
             if near_zone or near_ema:
                 return {
                     "state": "Bearish Pullback Watch",
-                    "idea": "Wait for rejection near supply / EMA, not a chase entry.",
+                    "grade": "B",
+                    "idea": "Watch for rejection in supply instead of forcing entry.",
                     "zone_low": z.low,
                     "zone_high": z.high,
                 }
@@ -338,22 +356,44 @@ def classify_setup(df: pd.DataFrame, zones: List[Zone], atr_mult_near: float = 0
         if nearest_demand and zone_distance_pct(close, nearest_demand[0]) < 1.0:
             return {
                 "state": "Bearish But Near Support",
-                "idea": "Be careful. Price is getting close to demand/support.",
+                "grade": "C",
+                "idea": "Trend is down, but nearby demand can cause a bounce.",
                 "zone_low": nearest_demand[0].low,
                 "zone_high": nearest_demand[0].high,
             }
 
-        return {"state": "Bearish Trend - No Pullback", "idea": "Wait for a pullback instead of chasing."}
+        return {
+            "state": "Bearish Trend - No Pullback",
+            "grade": "Wait",
+            "idea": "Trend is good, but entry location is not. Wait for pullback.",
+        }
 
     nearest_demand = nearest_zones(close, zones, "demand", n=1)
     nearest_supply = nearest_zones(close, zones, "supply", n=1)
 
     if nearest_demand and price_in_zone(close, nearest_demand[0]):
-        return {"state": "Neutral In Demand", "idea": "Possible bounce area, but trend confirmation is weak."}
-    if nearest_supply and price_in_zone(close, nearest_supply[0]):
-        return {"state": "Neutral In Supply", "idea": "Possible rejection area, but trend confirmation is weak."}
+        return {
+            "state": "Neutral In Demand",
+            "grade": "B-",
+            "idea": "Potential bounce area, but trend confirmation is weak.",
+            "zone_low": nearest_demand[0].low,
+            "zone_high": nearest_demand[0].high,
+        }
 
-    return {"state": "Neutral / No Setup", "idea": "No clean edge right now."}
+    if nearest_supply and price_in_zone(close, nearest_supply[0]):
+        return {
+            "state": "Neutral In Supply",
+            "grade": "B-",
+            "idea": "Potential rejection area, but trend confirmation is weak.",
+            "zone_low": nearest_supply[0].low,
+            "zone_high": nearest_supply[0].high,
+        }
+
+    return {
+        "state": "Neutral / No Setup",
+        "grade": "Skip",
+        "idea": "No clean edge right now.",
+    }
 
 # =========================================================
 # CHART
@@ -390,10 +430,6 @@ def make_chart(df: pd.DataFrame, zones: List[Zone], bars: int = 180) -> go.Figur
             name="EMA Slow",
         )
     )
-
-    recent_index = plot_df.index
-    x0 = recent_index.min()
-    x1 = recent_index.max()
 
     for z in zones:
         label = "Demand" if z.kind == "demand" else "Supply"
@@ -456,21 +492,13 @@ with f:
 with g:
     atr_zone_mult = st.number_input("Zone Width ATR", min_value=0.2, max_value=2.0, value=0.7, step=0.1)
 
-if not FINNHUB_API_KEY:
-    st.error("Missing FINNHUB_API_KEY in Streamlit secrets.")
-    st.stop()
-
 # =========================================================
 # LOAD DATA
 # =========================================================
-try:
-    df = get_candles(symbol, resolution=resolution, bars=260)
-except Exception as e:
-    st.error(f"Failed to load Finnhub candles: {e}")
-    st.stop()
+df = get_candles(symbol, interval=resolution, bars=260)
 
 if df.empty:
-    st.error("No candle data returned.")
+    st.error("No candle data returned. Try another symbol or timeframe.")
     st.stop()
 
 df = detect_trend(df, int(fast_ema), int(slow_ema))
@@ -489,23 +517,21 @@ last = df.iloc[-1]
 spot = float(last["Close"])
 trend = str(last["Trend"])
 atr_val = float(last["ATR"]) if pd.notna(last["ATR"]) else np.nan
-quote = get_quote(symbol)
+extended_now = is_extended(df, atr_mult=1.5)
+rejection_now = rejection_signal(df)
 
 # =========================================================
 # SUMMARY
 # =========================================================
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Spot", f"{spot:.2f}")
 m2.metric("Trend", trend)
 m3.metric("ATR(14)", f"{atr_val:.2f}" if pd.notna(atr_val) else "n/a")
 m4.metric("Setup", setup.get("state", "n/a"))
+m5.metric("Grade", setup.get("grade", "n/a"))
 
-if quote and quote.get("timestamp"):
-    try:
-        qdt = datetime.utcfromtimestamp(int(quote["timestamp"]))
-        st.caption(f"Finnhub quote timestamp (UTC): {qdt}")
-    except Exception:
-        pass
+if extended_now:
+    st.warning("Price is extended from the fast EMA. Do not chase here.")
 
 # =========================================================
 # CHART
@@ -519,7 +545,9 @@ st.subheader("Current Read")
 st.write(
     f"""
 **State:** {setup.get('state', 'n/a')}  
-**Idea:** {setup.get('idea', 'n/a')}
+**Grade:** {setup.get('grade', 'n/a')}  
+**Idea:** {setup.get('idea', 'n/a')}  
+**Latest Candle Signal:** {rejection_now}
 """
 )
 
@@ -551,7 +579,7 @@ if st.button("Scan Watchlist"):
 
     for sym in symbols:
         try:
-            h = get_candles(sym, resolution="D", bars=220)
+            h = get_candles(sym, interval="D", bars=220)
             if h.empty or len(h) < 80:
                 continue
 
@@ -567,6 +595,7 @@ if st.button("Scan Watchlist"):
                     "Close": round(float(last_row["Close"]), 2),
                     "Trend": str(last_row["Trend"]),
                     "Setup": s.get("state", "n/a"),
+                    "Grade": s.get("grade", "n/a"),
                     "Idea": s.get("idea", "n/a"),
                 }
             )
@@ -579,19 +608,14 @@ if st.button("Scan Watchlist"):
         st.info("No symbols scanned successfully.")
     else:
         priority = {
-            "Bullish Pullback In Demand": 1,
-            "Bearish Pullback In Supply": 2,
-            "Bullish Pullback Watch": 3,
-            "Bearish Pullback Watch": 4,
-            "Bullish But Near Resistance": 5,
-            "Bearish But Near Support": 6,
-            "Bullish Trend - No Pullback": 7,
-            "Bearish Trend - No Pullback": 8,
-            "Neutral In Demand": 9,
-            "Neutral In Supply": 10,
-            "Neutral / No Setup": 11,
+            "A+": 1,
+            "A": 2,
+            "B": 3,
+            "B-": 4,
+            "C": 5,
+            "Wait": 6,
+            "Skip": 7,
         }
-        scan_df["Sort"] = scan_df["Setup"].map(priority).fillna(99)
+        scan_df["Sort"] = scan_df["Grade"].map(priority).fillna(99)
         scan_df = scan_df.sort_values(["Sort", "Symbol"]).drop(columns=["Sort"])
         st.dataframe(scan_df, use_container_width=True)
-        
