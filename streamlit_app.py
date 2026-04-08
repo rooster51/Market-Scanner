@@ -1,108 +1,158 @@
+# streamlit_app.py
+
+import math
+import warnings
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+import plotly.graph_objects as go
 
-# =========================================================
-# PAGE CONFIG
-# =========================================================
-st.set_page_config(page_title="A+ Zone Opportunity Scanner", layout="wide")
-st.title("A+ Zone Opportunity Scanner")
-st.caption("Trend + support/resistance + supply/demand + pullback + no-chase warnings")
+warnings.filterwarnings("ignore")
 
-DEFAULT_WATCHLIST = "SPY, QQQ, IWM, AAPL, NVDA, AMD, TSLA, META"
+st.set_page_config(page_title="Trade Setup Scanner", layout="wide")
 
-# =========================================================
-# DATA STRUCTURES
-# =========================================================
-@dataclass
-class Zone:
-    low: float
-    high: float
-    kind: str   # demand / supply
-    touches: int
-    source_indices: List[int]
+# =========================
+# CONFIG
+# =========================
+DEFAULT_TICKERS = [
+    "SPY","QQQ","IWM","DIA",
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA",
+    "AMD","AVGO","NFLX","JPM","XOM","LLY","UNH","COST","CRM",
+    "PLTR","MU","SMCI","BA","DIS","SHOP","COIN"
+]
 
-# =========================================================
+SECTOR_ETFS = [
+    "XLK","XLF","XLE","XLV","XLY","XLI","XLP","XLB","XLU","XLC","VNQ","SMH"
+]
+
+# =========================
+# HELPERS
+# =========================
+def safe_float(x, default=np.nan):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def round_to_step(value: float, step: float, direction: str = "nearest") -> float:
+    if step <= 0:
+        return value
+    if direction == "up":
+        return math.ceil(value / step) * step
+    elif direction == "down":
+        return math.floor(value / step) * step
+    return round(value / step) * step
+
+
+def infer_strike_step(price: float) -> float:
+    if price < 25:
+        return 0.5
+    elif price < 100:
+        return 1.0
+    elif price < 250:
+        return 2.5
+    elif price < 500:
+        return 5.0
+    return 10.0
+
+
+def pct(a, b):
+    if b == 0 or pd.isna(a) or pd.isna(b):
+        return np.nan
+    return (a / b - 1.0) * 100.0
+
+
+# =========================
 # DATA
-# =========================================================
-def get_candles(symbol: str, interval: str = "D", bars: int = 300) -> pd.DataFrame:
-    interval_map = {
-        "D": ("1y", "1d"),
-        "60": ("6mo", "60m"),
-        "30": ("60d", "30m"),
-        "15": ("30d", "15m"),
-        "5": ("7d", "5m"),
-        "W": ("5y", "1wk"),
-    }
-
-    period, yf_interval = interval_map.get(interval, ("1y", "1d"))
-
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period=period, interval=yf_interval, auto_adjust=False)
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
+# =========================
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_price_history(ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+    df = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-
+        df.columns = [c[0] for c in df.columns]
+    df = df.rename(columns=str.title)
     needed = ["Open", "High", "Low", "Close", "Volume"]
-    if not all(col in df.columns for col in needed):
-        return pd.DataFrame()
+    for c in needed:
+        if c not in df.columns:
+            df[c] = np.nan
+    df = df[needed].dropna(subset=["Close"])
+    return df.copy()
 
-    df = df[needed].copy()
-    for col in needed:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    return df.dropna().tail(bars)
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_option_expirations(ticker: str) -> List[str]:
+    try:
+        tk = yf.Ticker(ticker)
+        return list(tk.options)
+    except Exception:
+        return []
 
-# =========================================================
-# TECHNICALS
-# =========================================================
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
 
-def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    hl = df["High"] - df["Low"]
-    hc = (df["High"] - df["Close"].shift()).abs()
-    lc = (df["Low"] - df["Close"].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.rolling(length).mean()
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_option_chain(ticker: str, expiration: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    try:
+        tk = yf.Ticker(ticker)
+        chain = tk.option_chain(expiration)
+        calls = chain.calls.copy() if chain.calls is not None else pd.DataFrame()
+        puts = chain.puts.copy() if chain.puts is not None else pd.DataFrame()
+        return calls, puts
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
 
-def detect_trend(df: pd.DataFrame, fast_len: int = 20, slow_len: int = 50) -> pd.DataFrame:
+
+# =========================
+# INDICATORS
+# =========================
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out["EMA_FAST"] = ema(out["Close"], fast_len)
-    out["EMA_SLOW"] = ema(out["Close"], slow_len)
-    out["FAST_SLOPE"] = out["EMA_FAST"].diff()
-    out["SLOW_SLOPE"] = out["EMA_SLOW"].diff()
 
-    def label(row):
-        if (
-            row["Close"] > row["EMA_FAST"] > row["EMA_SLOW"]
-            and row["FAST_SLOPE"] > 0
-            and row["SLOW_SLOPE"] > 0
-        ):
-            return "Bullish"
-        if (
-            row["Close"] < row["EMA_FAST"] < row["EMA_SLOW"]
-            and row["FAST_SLOPE"] < 0
-            and row["SLOW_SLOPE"] < 0
-        ):
-            return "Bearish"
-        return "Neutral"
+    out["EMA20"] = out["Close"].ewm(span=20, adjust=False).mean()
+    out["EMA50"] = out["Close"].ewm(span=50, adjust=False).mean()
+    out["EMA200"] = out["Close"].ewm(span=200, adjust=False).mean()
 
-    out["Trend"] = out.apply(label, axis=1)
+    delta = out["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out["RSI14"] = 100 - (100 / (1 + rs))
+
+    prev_close = out["Close"].shift(1)
+    tr1 = out["High"] - out["Low"]
+    tr2 = (out["High"] - prev_close).abs()
+    tr3 = (out["Low"] - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    out["ATR14"] = tr.rolling(14).mean()
+
+    out["VOL20"] = out["Volume"].rolling(20).mean()
+    out["RET20"] = out["Close"].pct_change(20)
+    out["RET60"] = out["Close"].pct_change(60)
+
     return out
 
-# =========================================================
+
+# =========================
 # ZONES
-# =========================================================
-def find_pivots(df: pd.DataFrame, left: int = 3, right: int = 3) -> Tuple[List[int], List[int]]:
+# =========================
+@dataclass
+class Zone:
+    kind: str          # "supply" or "demand"
+    low: float
+    high: float
+    pivot_idx: int
+    touches: int
+    freshness: int     # bars since pivot
+
+
+def detect_pivots(df: pd.DataFrame, left: int = 3, right: int = 3) -> Tuple[List[int], List[int]]:
     highs = df["High"].values
     lows = df["Low"].values
 
@@ -110,512 +160,575 @@ def find_pivots(df: pd.DataFrame, left: int = 3, right: int = 3) -> Tuple[List[i
     pivot_lows = []
 
     for i in range(left, len(df) - right):
-        if highs[i] == max(highs[i - left:i + right + 1]) and highs[i] > max(highs[i - left:i]):
-            pivot_highs.append(i)
-        if lows[i] == min(lows[i - left:i + right + 1]) and lows[i] < min(lows[i - left:i]):
-            pivot_lows.append(i)
+        window_high = highs[i-left:i+right+1]
+        window_low = lows[i-left:i+right+1]
+
+        if highs[i] == np.max(window_high):
+            if list(window_high).count(highs[i]) == 1:
+                pivot_highs.append(i)
+
+        if lows[i] == np.min(window_low):
+            if list(window_low).count(lows[i]) == 1:
+                pivot_lows.append(i)
 
     return pivot_highs, pivot_lows
 
-def build_raw_zones(
-    df: pd.DataFrame,
-    pivot_indices: List[int],
-    zone_type: str,
-    atr_values: pd.Series,
-    width_atr_mult: float = 0.7,
-) -> List[Zone]:
-    zones = []
 
-    for idx in pivot_indices:
-        atr_here = atr_values.iloc[idx]
-        if pd.isna(atr_here) or atr_here <= 0:
-            continue
-
-        price = df["High"].iloc[idx] if zone_type == "supply" else df["Low"].iloc[idx]
-        half = atr_here * width_atr_mult / 2.0
-
-        zones.append(
-            Zone(
-                low=float(price - half),
-                high=float(price + half),
-                kind=zone_type,
-                touches=1,
-                source_indices=[idx],
-            )
-        )
-
-    return zones
-
-def merge_zones(zones: List[Zone], overlap_threshold: float = 0.35) -> List[Zone]:
-    if not zones:
+def build_zones(df: pd.DataFrame, max_zones: int = 6) -> List[Zone]:
+    if len(df) < 60:
         return []
 
-    zones = sorted(zones, key=lambda z: (z.kind, z.low))
-    merged = []
+    ph, pl = detect_pivots(df, left=3, right=3)
+    atr = safe_float(df["ATR14"].iloc[-1], 0)
+    if pd.isna(atr) or atr <= 0:
+        atr = safe_float((df["High"] - df["Low"]).rolling(14).mean().iloc[-1], 1.0)
+    zone_half = max(atr * 0.5, df["Close"].iloc[-1] * 0.005)
 
+    zones: List[Zone] = []
+
+    for idx in ph:
+        p = safe_float(df["High"].iloc[idx])
+        z = Zone(
+            kind="supply",
+            low=p - zone_half,
+            high=p + zone_half,
+            pivot_idx=idx,
+            touches=0,
+            freshness=len(df) - idx
+        )
+        zones.append(z)
+
+    for idx in pl:
+        p = safe_float(df["Low"].iloc[idx])
+        z = Zone(
+            kind="demand",
+            low=p - zone_half,
+            high=p + zone_half,
+            pivot_idx=idx,
+            touches=0,
+            freshness=len(df) - idx
+        )
+        zones.append(z)
+
+    # Count touches after pivot
     for z in zones:
-        if not merged or merged[-1].kind != z.kind:
-            merged.append(z)
+        future = df.iloc[z.pivot_idx + 1:]
+        if len(future) == 0:
             continue
+        hits = ((future["High"] >= z.low) & (future["Low"] <= z.high)).sum()
+        z.touches = int(hits)
 
-        prev = merged[-1]
-        overlap_low = max(prev.low, z.low)
-        overlap_high = min(prev.high, z.high)
-        overlap = max(0.0, overlap_high - overlap_low)
+    # Score zones: recent + moderate touches
+    def zone_score(z: Zone):
+        freshness_score = max(0, 120 - z.freshness)
+        touch_score = 15 if 1 <= z.touches <= 4 else 5 if z.touches == 0 else 0
+        return freshness_score + touch_score
 
-        prev_size = prev.high - prev.low
-        z_size = z.high - z.low
-        min_size = max(min(prev_size, z_size), 1e-9)
+    zones = sorted(zones, key=zone_score, reverse=True)
 
-        if overlap / min_size >= overlap_threshold:
-            prev.low = min(prev.low, z.low)
-            prev.high = max(prev.high, z.high)
-            prev.touches += z.touches
-            prev.source_indices.extend(z.source_indices)
-        else:
+    # Merge overlapping similar zones
+    merged = []
+    for z in zones:
+        overlap = False
+        for m in merged:
+            if z.kind == m.kind and not (z.high < m.low or z.low > m.high):
+                m.low = min(m.low, z.low)
+                m.high = max(m.high, z.high)
+                m.touches = max(m.touches, z.touches)
+                m.freshness = min(m.freshness, z.freshness)
+                overlap = True
+                break
+        if not overlap:
             merged.append(z)
 
-    return merged
+    return merged[:max_zones]
 
-def score_zones(df: pd.DataFrame, zones: List[Zone], lookback_bars: int = 150) -> List[Zone]:
-    recent = df.tail(lookback_bars)
-    scored = []
 
-    for z in zones:
-        touches = 0
-        for _, row in recent.iterrows():
-            if row["High"] >= z.low and row["Low"] <= z.high:
-                touches += 1
-        z.touches = max(z.touches, touches)
-        scored.append(z)
+def nearest_zones(price: float, zones: List[Zone]) -> Dict[str, Optional[Zone]]:
+    supply_above = [z for z in zones if z.kind == "supply" and z.low > price]
+    demand_below = [z for z in zones if z.kind == "demand" and z.high < price]
 
-    return sorted(scored, key=lambda x: (x.kind, -x.touches))
-
-def build_zones(df: pd.DataFrame, pivot_left: int, pivot_right: int, atr_width_mult: float) -> List[Zone]:
-    ph, pl = find_pivots(df, left=pivot_left, right=pivot_right)
-
-    raw_supply = build_raw_zones(df, ph, "supply", df["ATR"], atr_width_mult)
-    raw_demand = build_raw_zones(df, pl, "demand", df["ATR"], atr_width_mult)
-
-    supply = merge_zones(raw_supply)
-    demand = merge_zones(raw_demand)
-
-    return score_zones(df, supply + demand)
-
-def zone_center(z: Zone) -> float:
-    return (z.low + z.high) / 2.0
-
-def nearest_zones(price: float, zones: List[Zone], kind: str, n: int = 5) -> List[Zone]:
-    filtered = [z for z in zones if z.kind == kind]
-    return sorted(filtered, key=lambda z: abs(zone_center(z) - price))[:n]
-
-def price_in_zone(price: float, z: Zone) -> bool:
-    return z.low <= price <= z.high
-
-def zone_distance_pct(price: float, z: Zone) -> float:
-    return abs(price - zone_center(z)) / max(price, 1e-9) * 100.0
-
-# =========================================================
-# SETUP LOGIC
-# =========================================================
-def is_extended(df: pd.DataFrame, atr_mult: float = 1.5) -> bool:
-    row = df.iloc[-1]
-    if pd.isna(row["ATR"]) or row["ATR"] <= 0:
-        return False
-    distance = abs(float(row["Close"]) - float(row["EMA_FAST"]))
-    return distance > float(row["ATR"]) * atr_mult
-
-def rejection_signal(df: pd.DataFrame) -> str:
-    if len(df) < 2:
-        return "None"
-
-    row = df.iloc[-1]
-    body = abs(row["Close"] - row["Open"])
-    rng = row["High"] - row["Low"]
-
-    if rng <= 0:
-        return "None"
-
-    upper_wick = row["High"] - max(row["Open"], row["Close"])
-    lower_wick = min(row["Open"], row["Close"]) - row["Low"]
-
-    if lower_wick > body * 1.5 and lower_wick > upper_wick:
-        return "Bullish Rejection"
-    if upper_wick > body * 1.5 and upper_wick > lower_wick:
-        return "Bearish Rejection"
-
-    return "None"
-
-def classify_setup(df: pd.DataFrame, zones: List[Zone], atr_mult_near: float = 0.8) -> dict:
-    if len(df) < 60:
-        return {"state": "Not enough data", "grade": "Skip", "idea": "Need more data."}
-
-    row = df.iloc[-1]
-    close = float(row["Close"])
-    low = float(row["Low"])
-    high = float(row["High"])
-    trend = row["Trend"]
-    current_atr = float(row["ATR"]) if not pd.isna(row["ATR"]) else 0.0
-    ema_fast = float(row["EMA_FAST"])
-    extended = is_extended(df, atr_mult=1.5)
-    rejection = rejection_signal(df)
-
-    demand = nearest_zones(close, zones, "demand", n=5)
-    supply = nearest_zones(close, zones, "supply", n=5)
-
-    if extended:
-        return {
-            "state": "Extended - Skip",
-            "grade": "Skip",
-            "idea": "Price is stretched too far from EMA. Do not chase.",
-        }
-
-    if trend == "Bullish":
-        for z in demand:
-            near_zone = low <= z.high + current_atr * atr_mult_near and close >= z.low - current_atr * atr_mult_near
-            near_ema = abs(close - ema_fast) <= current_atr * atr_mult_near
-            in_zone = price_in_zone(close, z)
-
-            if in_zone and rejection == "Bullish Rejection":
-                return {
-                    "state": "Bullish Pullback In Demand",
-                    "grade": "A+",
-                    "idea": "Best area to stalk bullish continuation.",
-                    "zone_low": z.low,
-                    "zone_high": z.high,
-                }
-
-            if in_zone:
-                return {
-                    "state": "Bullish Pullback In Demand",
-                    "grade": "A",
-                    "idea": "Good area, but wait for a stronger reaction candle.",
-                    "zone_low": z.low,
-                    "zone_high": z.high,
-                }
-
-            if near_zone or near_ema:
-                return {
-                    "state": "Bullish Pullback Watch",
-                    "grade": "B",
-                    "idea": "Watch for price to react in demand instead of forcing entry.",
-                    "zone_low": z.low,
-                    "zone_high": z.high,
-                }
-
-        nearest_supply = nearest_zones(close, zones, "supply", n=1)
-        if nearest_supply and zone_distance_pct(close, nearest_supply[0]) < 1.0:
-            return {
-                "state": "Bullish But Near Resistance",
-                "grade": "C",
-                "idea": "Trend is up, but overhead supply is close. Risk of reversal is higher.",
-                "zone_low": nearest_supply[0].low,
-                "zone_high": nearest_supply[0].high,
-            }
-
-        return {
-            "state": "Bullish Trend - No Pullback",
-            "grade": "Wait",
-            "idea": "Trend is good, but entry location is not. Wait for pullback.",
-        }
-
-    if trend == "Bearish":
-        for z in supply:
-            near_zone = high >= z.low - current_atr * atr_mult_near and close <= z.high + current_atr * atr_mult_near
-            near_ema = abs(close - ema_fast) <= current_atr * atr_mult_near
-            in_zone = price_in_zone(close, z)
-
-            if in_zone and rejection == "Bearish Rejection":
-                return {
-                    "state": "Bearish Pullback In Supply",
-                    "grade": "A+",
-                    "idea": "Best area to stalk bearish continuation.",
-                    "zone_low": z.low,
-                    "zone_high": z.high,
-                }
-
-            if in_zone:
-                return {
-                    "state": "Bearish Pullback In Supply",
-                    "grade": "A",
-                    "idea": "Good area, but wait for a stronger rejection candle.",
-                    "zone_low": z.low,
-                    "zone_high": z.high,
-                }
-
-            if near_zone or near_ema:
-                return {
-                    "state": "Bearish Pullback Watch",
-                    "grade": "B",
-                    "idea": "Watch for rejection in supply instead of forcing entry.",
-                    "zone_low": z.low,
-                    "zone_high": z.high,
-                }
-
-        nearest_demand = nearest_zones(close, zones, "demand", n=1)
-        if nearest_demand and zone_distance_pct(close, nearest_demand[0]) < 1.0:
-            return {
-                "state": "Bearish But Near Support",
-                "grade": "C",
-                "idea": "Trend is down, but nearby demand can cause a bounce.",
-                "zone_low": nearest_demand[0].low,
-                "zone_high": nearest_demand[0].high,
-            }
-
-        return {
-            "state": "Bearish Trend - No Pullback",
-            "grade": "Wait",
-            "idea": "Trend is good, but entry location is not. Wait for pullback.",
-        }
-
-    nearest_demand = nearest_zones(close, zones, "demand", n=1)
-    nearest_supply = nearest_zones(close, zones, "supply", n=1)
-
-    if nearest_demand and price_in_zone(close, nearest_demand[0]):
-        return {
-            "state": "Neutral In Demand",
-            "grade": "B-",
-            "idea": "Potential bounce area, but trend confirmation is weak.",
-            "zone_low": nearest_demand[0].low,
-            "zone_high": nearest_demand[0].high,
-        }
-
-    if nearest_supply and price_in_zone(close, nearest_supply[0]):
-        return {
-            "state": "Neutral In Supply",
-            "grade": "B-",
-            "idea": "Potential rejection area, but trend confirmation is weak.",
-            "zone_low": nearest_supply[0].low,
-            "zone_high": nearest_supply[0].high,
-        }
+    nearest_supply = min(supply_above, key=lambda z: z.low - price) if supply_above else None
+    nearest_demand = min(demand_below, key=lambda z: price - z.high) if demand_below else None
 
     return {
-        "state": "Neutral / No Setup",
-        "grade": "Skip",
-        "idea": "No clean edge right now.",
+        "supply": nearest_supply,
+        "demand": nearest_demand
     }
 
-# =========================================================
-# CHART
-# =========================================================
-def make_chart(df: pd.DataFrame, zones: List[Zone], bars: int = 180) -> go.Figure:
-    plot_df = df.tail(bars).copy()
+
+# =========================
+# SCORING
+# =========================
+def score_setup(df: pd.DataFrame, zones: List[Zone]) -> Dict[str, float]:
+    row = df.iloc[-1]
+    close = safe_float(row["Close"])
+    ema20 = safe_float(row["EMA20"])
+    ema50 = safe_float(row["EMA50"])
+    ema200 = safe_float(row["EMA200"])
+    rsi = safe_float(row["RSI14"])
+    ret20 = safe_float(row["RET20"])
+    ret60 = safe_float(row["RET60"])
+    atr = safe_float(row["ATR14"])
+
+    trend_score = 0
+    if close > ema20:
+        trend_score += 10
+    if close > ema50:
+        trend_score += 12
+    if close > ema200:
+        trend_score += 15
+    if ema20 > ema50 > ema200:
+        trend_score += 18
+    elif ema20 < ema50 < ema200:
+        trend_score -= 18
+
+    momentum_score = 0
+    if pd.notna(rsi):
+        if 52 <= rsi <= 68:
+            momentum_score += 12
+        elif 45 <= rsi < 52:
+            momentum_score += 6
+        elif rsi > 75:
+            momentum_score -= 5
+        elif rsi < 35:
+            momentum_score -= 5
+
+    if pd.notna(ret20):
+        momentum_score += max(-8, min(8, ret20 * 100))
+    if pd.notna(ret60):
+        momentum_score += max(-10, min(10, ret60 * 60))
+
+    structure_score = 0
+    nz = nearest_zones(close, zones)
+    supply = nz["supply"]
+    demand = nz["demand"]
+
+    if demand is not None:
+        dist_to_demand = close - demand.high
+        if atr > 0:
+            atrs = dist_to_demand / atr
+            if 0.2 <= atrs <= 1.5:
+                structure_score += 10
+            elif atrs > 4:
+                structure_score -= 4
+
+    if supply is not None:
+        dist_to_supply = supply.low - close
+        if atr > 0:
+            atrs = dist_to_supply / atr
+            if 0.5 <= atrs <= 3.0:
+                structure_score += 8
+            elif atrs < 0.25:
+                structure_score -= 10
+
+    total = trend_score + momentum_score + structure_score
+
+    direction = "Neutral"
+    if close > ema50 and ema20 > ema50 and rsi >= 50:
+        direction = "Bullish"
+    elif close < ema50 and ema20 < ema50 and rsi <= 50:
+        direction = "Bearish"
+
+    return {
+        "trend_score": round(trend_score, 2),
+        "momentum_score": round(momentum_score, 2),
+        "structure_score": round(structure_score, 2),
+        "setup_score": round(total, 2),
+        "direction_num": 1 if direction == "Bullish" else -1 if direction == "Bearish" else 0,
+        "direction": direction
+    }
+
+
+# =========================
+# OPTIONS / STRATEGY LOGIC
+# =========================
+def get_iv_proxy(ticker: str) -> float:
+    expirations = load_option_expirations(ticker)
+    if not expirations:
+        return np.nan
+
+    for exp in expirations[:2]:
+        calls, puts = load_option_chain(ticker, exp)
+        ivs = []
+        if not calls.empty and "impliedVolatility" in calls.columns:
+            ivs.extend(calls["impliedVolatility"].dropna().tolist())
+        if not puts.empty and "impliedVolatility" in puts.columns:
+            ivs.extend(puts["impliedVolatility"].dropna().tolist())
+        if ivs:
+            iv = float(np.nanmedian(ivs))
+            if iv > 0:
+                return iv
+    return np.nan
+
+
+def suggest_strategy(
+    ticker: str,
+    df: pd.DataFrame,
+    zones: List[Zone],
+    score: Dict[str, float],
+    use_options_data: bool = True
+) -> Dict[str, str]:
+    row = df.iloc[-1]
+    price = safe_float(row["Close"])
+    atr = safe_float(row["ATR14"])
+    rsi = safe_float(row["RSI14"])
+    direction = score["direction"]
+    score_val = score["setup_score"]
+    iv_proxy = get_iv_proxy(ticker) if use_options_data else np.nan
+
+    nz = nearest_zones(price, zones)
+    nearest_supply = nz["supply"]
+    nearest_demand = nz["demand"]
+
+    dist_supply = (nearest_supply.low - price) if nearest_supply else np.nan
+    dist_demand = (price - nearest_demand.high) if nearest_demand else np.nan
+
+    strategy = "Watchlist"
+    reason = "No clean edge."
+    setup = ""
+
+    # Bullish
+    if direction == "Bullish":
+        if pd.notna(iv_proxy) and iv_proxy >= 0.40:
+            strategy = "Bull Put Spread"
+            reason = "Bullish trend with elevated IV favors selling premium."
+        elif score_val >= 40 and rsi < 70:
+            strategy = "Buy Stock / Call"
+            reason = "Strong directional trend and momentum."
+        else:
+            strategy = "Bull Call LEAPS"
+            reason = "Trend is constructive but a longer time horizon may fit better."
+
+        short_put, long_put = bullish_spread_strikes_outside_demand(price, atr, nearest_demand)
+        if short_put is not None:
+            setup = f"Sell {short_put:.2f}P / Buy {long_put:.2f}P (below demand zone)"
+        else:
+            setup = "No clean put spread strike outside demand zone"
+
+    # Bearish
+    elif direction == "Bearish":
+        if pd.notna(iv_proxy) and iv_proxy >= 0.40:
+            strategy = "Bear Call Spread"
+            reason = "Bearish trend with elevated IV favors selling premium."
+        elif score_val <= -20:
+            strategy = "Buy Put"
+            reason = "Weak trend and momentum support outright bearish exposure."
+        else:
+            strategy = "Bear Put LEAPS"
+            reason = "Bearish structure may work better with more time."
+
+        short_call, long_call = bearish_spread_strikes_outside_supply(price, atr, nearest_supply)
+        if short_call is not None:
+            setup = f"Sell {short_call:.2f}C / Buy {long_call:.2f}C (above supply zone)"
+        else:
+            setup = "No clean call spread strike outside supply zone"
+
+    else:
+        strategy = "Watchlist / Defined Risk Spread"
+        reason = "Mixed trend. Wait for cleaner alignment."
+        setup = "Wait for break above supply or reclaim from demand"
+
+    if strategy == "Bull Call LEAPS":
+        leap_strike = round_to_step(price * 0.95, infer_strike_step(price), "nearest")
+        setup = f"Buy 6-12 month {leap_strike:.2f}C"
+    elif strategy == "Bear Put LEAPS":
+        leap_strike = round_to_step(price * 1.05, infer_strike_step(price), "nearest")
+        setup = f"Buy 6-12 month {leap_strike:.2f}P"
+    elif strategy == "Buy Stock / Call":
+        call_strike = round_to_step(price, infer_strike_step(price), "nearest")
+        setup = f"Buy shares or near-ATM {call_strike:.2f}C"
+    elif strategy == "Buy Put":
+        put_strike = round_to_step(price, infer_strike_step(price), "nearest")
+        setup = f"Buy near-ATM {put_strike:.2f}P"
+
+    return {
+        "strategy": strategy,
+        "reason": reason,
+        "trade_setup": setup,
+        "iv_proxy": round(iv_proxy, 3) if pd.notna(iv_proxy) else np.nan,
+        "nearest_supply": f"{nearest_supply.low:.2f}-{nearest_supply.high:.2f}" if nearest_supply else "",
+        "nearest_demand": f"{nearest_demand.low:.2f}-{nearest_demand.high:.2f}" if nearest_demand else ""
+    }
+
+
+def bullish_spread_strikes_outside_demand(price: float, atr: float, demand_zone: Optional[Zone]) -> Tuple[Optional[float], Optional[float]]:
+    step = infer_strike_step(price)
+    width = step * 2 if price < 150 else step * 4
+
+    if demand_zone is not None:
+        # short put below demand low with small buffer
+        short_put = round_to_step(demand_zone.low - max(0.25 * atr, step), step, "down")
+    else:
+        short_put = round_to_step(price - max(1.5 * atr, 3 * step), step, "down")
+
+    long_put = short_put - width
+    if long_put <= 0:
+        return None, None
+    return short_put, long_put
+
+
+def bearish_spread_strikes_outside_supply(price: float, atr: float, supply_zone: Optional[Zone]) -> Tuple[Optional[float], Optional[float]]:
+    step = infer_strike_step(price)
+    width = step * 2 if price < 150 else step * 4
+
+    if supply_zone is not None:
+        # short call above supply high with small buffer
+        short_call = round_to_step(supply_zone.high + max(0.25 * atr, step), step, "up")
+    else:
+        short_call = round_to_step(price + max(1.5 * atr, 3 * step), step, "up")
+
+    long_call = short_call + width
+    return short_call, long_call
+
+
+# =========================
+# SCAN
+# =========================
+def analyze_ticker(ticker: str, use_options_data: bool = True) -> Optional[Dict]:
+    try:
+        df = load_price_history(ticker)
+        if df.empty or len(df) < 220:
+            return None
+
+        df = add_indicators(df)
+        zones = build_zones(df)
+        score = score_setup(df, zones)
+        strat = suggest_strategy(ticker, df, zones, score, use_options_data=use_options_data)
+
+        last = df.iloc[-1]
+        close = safe_float(last["Close"])
+        atr = safe_float(last["ATR14"])
+        rsi = safe_float(last["RSI14"])
+        ema20 = safe_float(last["EMA20"])
+        ema50 = safe_float(last["EMA50"])
+        ema200 = safe_float(last["EMA200"])
+
+        return {
+            "Ticker": ticker,
+            "Price": round(close, 2),
+            "ATR14": round(atr, 2) if pd.notna(atr) else np.nan,
+            "RSI14": round(rsi, 1) if pd.notna(rsi) else np.nan,
+            "EMA20": round(ema20, 2),
+            "EMA50": round(ema50, 2),
+            "EMA200": round(ema200, 2),
+            "Direction": score["direction"],
+            "TrendScore": score["trend_score"],
+            "MomentumScore": score["momentum_score"],
+            "StructureScore": score["structure_score"],
+            "SetupScore": score["setup_score"],
+            "Strategy": strat["strategy"],
+            "TradeSetup": strat["trade_setup"],
+            "Reason": strat["reason"],
+            "IVProxy": strat["iv_proxy"],
+            "NearestSupply": strat["nearest_supply"],
+            "NearestDemand": strat["nearest_demand"],
+            "Zones": zones,
+            "Data": df
+        }
+    except Exception:
+        return None
+
+
+# =========================
+# PLOTTING
+# =========================
+def plot_chart(df: pd.DataFrame, zones: List[Zone], ticker: str):
     fig = go.Figure()
 
-    fig.add_trace(
-        go.Candlestick(
-            x=plot_df.index,
-            open=plot_df["Open"],
-            high=plot_df["High"],
-            low=plot_df["Low"],
-            close=plot_df["Close"],
-            name="Price",
-        )
-    )
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df["Open"],
+        high=df["High"],
+        low=df["Low"],
+        close=df["Close"],
+        name="Price"
+    ))
 
-    fig.add_trace(
-        go.Scatter(
-            x=plot_df.index,
-            y=plot_df["EMA_FAST"],
-            mode="lines",
-            name="EMA Fast",
-        )
-    )
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA20"], mode="lines", name="EMA20"))
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA50"], mode="lines", name="EMA50"))
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA200"], mode="lines", name="EMA200"))
 
-    fig.add_trace(
-        go.Scatter(
-            x=plot_df.index,
-            y=plot_df["EMA_SLOW"],
-            mode="lines",
-            name="EMA Slow",
-        )
-    )
+    x0 = df.index[0]
+    x1 = df.index[-1]
 
     for z in zones:
-        label = "Demand" if z.kind == "demand" else "Supply"
-        fig.add_hrect(
-            y0=z.low,
-            y1=z.high,
-            line_width=0,
-            opacity=min(0.10 + z.touches * 0.01, 0.25),
-            annotation_text=f"{label} ({z.touches})",
-            annotation_position="top left",
+        fill = "rgba(255,0,0,0.12)" if z.kind == "supply" else "rgba(0,180,0,0.12)"
+        line = "rgba(255,0,0,0.35)" if z.kind == "supply" else "rgba(0,180,0,0.35)"
+        fig.add_shape(
+            type="rect",
+            x0=x0, x1=x1,
+            y0=z.low, y1=z.high,
+            fillcolor=fill,
+            line=dict(color=line, width=1),
+            layer="below"
         )
 
     fig.update_layout(
-        height=760,
-        xaxis_rangeslider_visible=False,
-        margin=dict(l=20, r=20, t=40, b=20),
+        title=f"{ticker} Price + Supply/Demand Zones",
+        xaxis_title="Date",
+        yaxis_title="Price",
+        height=650,
+        xaxis_rangeslider_visible=False
     )
     return fig
 
-# =========================================================
-# TABLE HELPERS
-# =========================================================
-def zone_table(zs: List[Zone], price: float) -> pd.DataFrame:
-    rows = []
-    for z in zs:
-        rows.append(
-            {
-                "Type": z.kind,
-                "Low": round(z.low, 2),
-                "High": round(z.high, 2),
-                "Center": round(zone_center(z), 2),
-                "Touches": z.touches,
-                "Distance %": round(zone_distance_pct(price, z), 2),
-            }
-        )
-    return pd.DataFrame(rows)
 
-# =========================================================
+# =========================
 # UI
-# =========================================================
-a, b, c, d = st.columns([1.2, 1, 1, 1])
+# =========================
+st.title("Stock Setup Scanner")
+st.caption("Scans stocks, scores setup quality, maps supply/demand zones, and suggests outright, LEAPS, or spreads outside zones.")
 
-with a:
-    symbol = st.text_input("Symbol", value="SPY").upper().strip()
+with st.sidebar:
+    st.header("Scan Settings")
 
-with b:
-    resolution = st.selectbox("Chart Resolution", ["D", "60", "30", "15", "5", "W"], index=0)
+    preset = st.selectbox(
+        "Universe",
+        ["Default List", "Sector ETFs", "Custom"]
+    )
 
-with c:
-    fast_ema = st.number_input("Fast EMA", min_value=5, max_value=50, value=20, step=1)
-
-with d:
-    slow_ema = st.number_input("Slow EMA", min_value=10, max_value=100, value=50, step=1)
-
-e, f, g = st.columns(3)
-with e:
-    pivot_left = st.number_input("Pivot Left", min_value=2, max_value=10, value=3, step=1)
-with f:
-    pivot_right = st.number_input("Pivot Right", min_value=2, max_value=10, value=3, step=1)
-with g:
-    atr_zone_mult = st.number_input("Zone Width ATR", min_value=0.2, max_value=2.0, value=0.7, step=0.1)
-
-# =========================================================
-# LOAD DATA
-# =========================================================
-df = get_candles(symbol, interval=resolution, bars=260)
-
-if df.empty:
-    st.error("No candle data returned. Try another symbol or timeframe.")
-    st.stop()
-
-df = detect_trend(df, int(fast_ema), int(slow_ema))
-df["ATR"] = atr(df, 14)
-
-zones = build_zones(
-    df=df,
-    pivot_left=int(pivot_left),
-    pivot_right=int(pivot_right),
-    atr_width_mult=float(atr_zone_mult),
-)
-
-setup = classify_setup(df, zones)
-
-last = df.iloc[-1]
-spot = float(last["Close"])
-trend = str(last["Trend"])
-atr_val = float(last["ATR"]) if pd.notna(last["ATR"]) else np.nan
-extended_now = is_extended(df, atr_mult=1.5)
-rejection_now = rejection_signal(df)
-
-# =========================================================
-# SUMMARY
-# =========================================================
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Spot", f"{spot:.2f}")
-m2.metric("Trend", trend)
-m3.metric("ATR(14)", f"{atr_val:.2f}" if pd.notna(atr_val) else "n/a")
-m4.metric("Setup", setup.get("state", "n/a"))
-m5.metric("Grade", setup.get("grade", "n/a"))
-
-if extended_now:
-    st.warning("Price is extended from the fast EMA. Do not chase here.")
-
-# =========================================================
-# CHART
-# =========================================================
-st.plotly_chart(make_chart(df, zones), use_container_width=True)
-
-# =========================================================
-# READOUT
-# =========================================================
-st.subheader("Current Read")
-st.write(
-    f"""
-**State:** {setup.get('state', 'n/a')}  
-**Grade:** {setup.get('grade', 'n/a')}  
-**Idea:** {setup.get('idea', 'n/a')}  
-**Latest Candle Signal:** {rejection_now}
-"""
-)
-
-if "zone_low" in setup and "zone_high" in setup:
-    st.write(f"**Relevant Zone:** {setup['zone_low']:.2f} to {setup['zone_high']:.2f}")
-
-# =========================================================
-# ZONES
-# =========================================================
-z1, z2 = st.columns(2)
-
-with z1:
-    st.markdown("### Demand / Support Areas")
-    st.dataframe(zone_table(nearest_zones(spot, zones, "demand", n=5), spot), use_container_width=True)
-
-with z2:
-    st.markdown("### Supply / Resistance Areas")
-    st.dataframe(zone_table(nearest_zones(spot, zones, "supply", n=5), spot), use_container_width=True)
-
-# =========================================================
-# WATCHLIST SCAN
-# =========================================================
-st.subheader("Watchlist Scanner")
-watchlist_text = st.text_area("Symbols", value=DEFAULT_WATCHLIST, height=100)
-
-if st.button("Scan Watchlist"):
-    rows = []
-    symbols = [x.strip().upper() for x in watchlist_text.split(",") if x.strip()]
-
-    for sym in symbols:
-        try:
-            h = get_candles(sym, interval="D", bars=220)
-            if h.empty or len(h) < 80:
-                continue
-
-            h = detect_trend(h, int(fast_ema), int(slow_ema))
-            h["ATR"] = atr(h, 14)
-            z = build_zones(h, int(pivot_left), int(pivot_right), float(atr_zone_mult))
-            s = classify_setup(h, z)
-            last_row = h.iloc[-1]
-
-            rows.append(
-                {
-                    "Symbol": sym,
-                    "Close": round(float(last_row["Close"]), 2),
-                    "Trend": str(last_row["Trend"]),
-                    "Setup": s.get("state", "n/a"),
-                    "Grade": s.get("grade", "n/a"),
-                    "Idea": s.get("idea", "n/a"),
-                }
-            )
-        except Exception:
-            continue
-
-    scan_df = pd.DataFrame(rows)
-
-    if scan_df.empty:
-        st.info("No symbols scanned successfully.")
+    if preset == "Default List":
+        tickers = DEFAULT_TICKERS
+    elif preset == "Sector ETFs":
+        tickers = SECTOR_ETFS
     else:
-        priority = {
-            "A+": 1,
-            "A": 2,
-            "B": 3,
-            "B-": 4,
-            "C": 5,
-            "Wait": 6,
-            "Skip": 7,
-        }
-        scan_df["Sort"] = scan_df["Grade"].map(priority).fillna(99)
-        scan_df = scan_df.sort_values(["Sort", "Symbol"]).drop(columns=["Sort"])
-        st.dataframe(scan_df, use_container_width=True)
+        custom = st.text_area("Custom tickers (comma separated)", value="SPY,QQQ,AAPL,MSFT,NVDA,AMD,AMZN,META")
+        tickers = [x.strip().upper() for x in custom.split(",") if x.strip()]
+
+    use_options_data = st.checkbox("Use options data for IV-based strategy tilt", value=True)
+    min_score = st.slider("Minimum setup score", -20, 80, 15)
+    top_n = st.slider("Top results", 5, 50, 15)
+
+    scan = st.button("Run Scan", type="primary")
+
+if "scan_results" not in st.session_state:
+    st.session_state.scan_results = pd.DataFrame()
+if "scan_raw" not in st.session_state:
+    st.session_state.scan_raw = []
+
+if scan:
+    results = []
+    raw = []
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    total = max(1, len(tickers))
+    for i, t in enumerate(tickers):
+        status.write(f"Scanning {t}...")
+        res = analyze_ticker(t, use_options_data=use_options_data)
+        if res is not None:
+            raw.append(res)
+            results.append({
+                k: v for k, v in res.items()
+                if k not in ["Zones", "Data"]
+            })
+        progress.progress((i + 1) / total)
+
+    df_res = pd.DataFrame(results)
+    if not df_res.empty:
+        df_res = df_res.sort_values(["SetupScore", "TrendScore"], ascending=False)
+        df_res = df_res[df_res["SetupScore"] >= min_score].head(top_n)
+
+    st.session_state.scan_results = df_res
+    st.session_state.scan_raw = raw
+    status.write("Done.")
+
+results_df = st.session_state.scan_results
+raw_results = st.session_state.scan_raw
+
+tab1, tab2, tab3 = st.tabs(["Scanner", "Chart Detail", "How It Thinks"])
+
+with tab1:
+    st.subheader("Scanner Results")
+
+    if results_df.empty:
+        st.info("Run the scan to see setups.")
+    else:
+        st.dataframe(results_df, use_container_width=True)
+
+        csv = results_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download results CSV",
+            data=csv,
+            file_name="scanner_results.csv",
+            mime="text/csv"
+        )
+
+        st.markdown("### Best-looking names")
+        for _, row in results_df.head(5).iterrows():
+            st.markdown(
+                f"""
+**{row['Ticker']}** — {row['Direction']}  
+Score: **{row['SetupScore']}**  
+Strategy: **{row['Strategy']}**  
+Setup: **{row['TradeSetup']}**  
+Reason: {row['Reason']}  
+Supply: {row['NearestSupply'] or 'N/A'} | Demand: {row['NearestDemand'] or 'N/A'}
+"""
+            )
+
+with tab2:
+    st.subheader("Chart Detail")
+
+    if not raw_results:
+        st.info("Run a scan first.")
+    else:
+        ticker_choices = [r["Ticker"] for r in raw_results if r["Ticker"] in set(results_df["Ticker"]) or results_df.empty]
+        if not ticker_choices:
+            ticker_choices = [r["Ticker"] for r in raw_results]
+
+        selected = st.selectbox("Select ticker", ticker_choices)
+        selected_result = next((r for r in raw_results if r["Ticker"] == selected), None)
+
+        if selected_result:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Price", selected_result["Price"])
+            c2.metric("Direction", selected_result["Direction"])
+            c3.metric("Setup Score", selected_result["SetupScore"])
+            c4.metric("Strategy", selected_result["Strategy"])
+
+            st.plotly_chart(
+                plot_chart(selected_result["Data"], selected_result["Zones"], selected),
+                use_container_width=True
+            )
+
+            zrows = []
+            for z in selected_result["Zones"]:
+                zrows.append({
+                    "Type": z.kind.title(),
+                    "Low": round(z.low, 2),
+                    "High": round(z.high, 2),
+                    "Touches": z.touches,
+                    "FreshnessBars": z.freshness
+                })
+            if zrows:
+                st.markdown("### Detected Zones")
+                st.dataframe(pd.DataFrame(zrows), use_container_width=True)
+
+            st.markdown("### Suggested Trade")
+            st.write(f"**Strategy:** {selected_result['Strategy']}")
+            st.write(f"**Setup:** {selected_result['TradeSetup']}")
+            st.write(f"**Reason:** {selected_result['Reason']}")
+            st.write(f"**Nearest Supply:** {selected_result['NearestSupply'] or 'N/A'}")
+            st.write(f"**Nearest Demand:** {selected_result['NearestDemand'] or 'N/A'}")
+            st.write(f"**IV Proxy:** {selected_result['IVProxy']}")
+
+with tab3:
+    st.subheader("How the scanner decides")
+    st.markdown(
+        """
+- **Bullish trend** generally means price is above EMA50, EMA20 > EMA50, and RSI is not weak.
+- **Bearish trend** is the opposite.
+- **Supply zones** come from pivot highs.
+- **Demand zones** come from pivot lows.
+- **Bull put spreads** are suggested with the short put **below the nearest demand zone**.
+- **Bear call spreads** are suggested with the short call **above the nearest supply zone**.
+- **LEAPS** are favored when the chart has a directional bias but not enough immediate edge for shorter-term entries.
+- **Buy outright** is favored when trend and momentum are both strong and clean.
+"""
+    )
+
+st.markdown("---")
+st.caption("For education only. Not financial advice.")
